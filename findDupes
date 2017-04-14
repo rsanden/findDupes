@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+
+import sys, os
+import subprocess
+import argparse
+
+from six.moves import input    # python2-compat
+
+ARGS = None
+
+# Internal Constants
+FDUPES_TMP_FILEPATH = './FDUPES.tmp.txt'
+
+def do_argparse():
+    parser = argparse.ArgumentParser(formatter_class=lambda prog: argparse.HelpFormatter(prog, max_help_position=100, width=150))
+    parser.add_argument('path', type=str, nargs='?', default='.', help="Default: .")
+    parser.add_argument('-i', '--ignore-basenames', action='store_true', help="ignore basenames when looking for choice precedents")
+    parser.add_argument('-n', '--nochoices', action='store_true', help="don't prompt for which duplicate to keep; always choose the first one")
+    parser.add_argument('-t', '--threshold', type=int, nargs=1, default=[0], metavar='SIZE', help="ignore files smaller than SIZE (in bytes)")
+    args = parser.parse_args()
+    args.threshold = args.threshold[0]
+    return args
+
+def do_fdupes():
+    if os.path.isfile(FDUPES_TMP_FILEPATH):
+        with open(FDUPES_TMP_FILEPATH, 'r') as fp:
+            print('Using fdupes data from {}'.format(os.path.relpath(FDUPES_TMP_FILEPATH)), file=sys.stderr)
+            fdupes_str = fp.read()
+    else:
+        fdupes_str = subprocess.check_output(['fdupes', '-S', '-r', ARGS.path]).decode('utf-8')
+        if fdupes_str:
+            try:
+                with open(FDUPES_TMP_FILEPATH, 'w') as fp:
+                    fp.write(fdupes_str)
+            except PermissionError as e:
+                pass
+    return fdupes_str
+
+def parse_dupes(fdupes_str):
+    """ Example:
+            1000 bytes each:
+            ./path/to/file1
+            ./path/to/file2
+            ./path/to/file3
+
+            1 byte each:
+            ./path/to/file4
+            ./path/to/file5
+            ./path/to/file6
+
+            ...
+            ...
+    """
+    groups = []
+    groups_strings = [x for x in fdupes_str.split('\n\n') if x]
+    for group_string in groups_strings:
+        group = [x for x in group_string.split('\n') if x]
+        if not group: continue
+
+        assert 'byte' in group[0]
+        size_str = group.pop(0)
+        size = int(size_str.strip().split(' ')[0])
+
+        if size < ARGS.threshold:
+            continue
+
+        if len(group) < 2:
+            continue
+
+        groups.append(sorted(group))
+    return sorted(groups)
+
+def input_int(minVal, maxVal, otherVals=[]):
+    while True:
+        choice = input("Keep which? ('!' to step back) --> ")
+        try:
+            if choice in otherVals:
+                return choice
+            choice = int(choice)
+            if choice < minVal or choice > maxVal:
+                continue
+            return choice
+        except ValueError as e:
+            continue
+
+def find_precedent(groups, choices, current_index, ignore_basenames=False):
+    """
+    Check for similar previous choices, which means that:
+        * The dirnames for a previous choice against its alternatives all match the current situation
+        * (Optionally) The basenames for the current choices all match each other
+
+    In that case, it's a very safe bet that we can imply the current choice from the previous one.
+
+    current_index represents the current group index (for which we intend to look for precedents)
+    """
+    current_group_dirnames = list(map(os.path.dirname, groups[current_index]))
+    current_group_basenames = list(map(os.path.basename, groups[current_index]))
+    for i, precedent_group in enumerate(groups):
+        if not choices[i]:
+            continue
+        precedent_group_dirnames = list(map(os.path.dirname, precedent_group))
+        if set(current_group_dirnames).issubset(set(precedent_group_dirnames)):
+            precedent_choice_dirname = os.path.dirname(choices[i])
+            if ignore_basenames or current_group_basenames.count(current_group_basenames[0]) == len(current_group_basenames):
+                return current_group_dirnames.index(precedent_choice_dirname)
+    return None
+
+def prompt_group(groups, i):
+    """ Prompt for a single group and return the user's choice """
+    print('\n=== {} / {} ==='.format(i+1, len(groups)))
+    for j, dupe in enumerate(groups[i]):
+        print(u'    {}: {}'.format(j+1, dupe))    # python2-compat
+    return input_int(minVal=1, maxVal=j+1, otherVals=['!'])
+
+def prompt_all_groups(groups):
+    """ Get user choices. Account for the UI operating in 1..N space instead of 0..(N-1) space """
+    choices = [None for _ in range(len(groups))]
+    seen_i = []
+    i = 0
+    while True:
+        if i == len(groups):
+            break
+
+        group = groups[i]
+        precedent = find_precedent(groups, choices, i, ignore_basenames=ARGS.ignore_basenames)
+        if precedent is not None:
+            choices[i] = group[precedent]
+            i += 1
+            continue
+
+        if ARGS.nochoices:
+            choice = 0
+        else:
+            choice = prompt_group(groups, i)
+
+        if choice == '!':
+            # Step backward
+            if len(seen_i) > 0:
+                last_i = seen_i.pop()
+                for j in range(last_i, i):
+                    choices[j] = None
+                i = last_i
+            else:
+                i = 0
+        else:
+            # Step forward
+            seen_i.append(i)
+            choices[i] = group[choice-1]
+            i += 1
+    return choices
+
+def delete_files(groups, choices):
+    todelete = {}
+    for i, group in enumerate(groups):
+        group.remove(choices[i])
+        for f in group:
+            todelete[f] = choices[i]
+
+    print('\n=== Print Commands ===')
+    while True:
+        choice = input('What do you want to do? Enter "Delete", "Hardlink", or "Symlink" --> ')
+        if choice in ["Delete", "Hardlink", "Symlink"]:
+            break
+
+    rm_cmds = {}
+    ln_cmds = {}
+    sy_cmds = {}
+    for f, src in todelete.items():
+        rm_cmds[f] = "rm '{}'".format(f)
+        ln_cmds[f] = "ln '{}' '{}'".format(src, f)
+        sy_cmds[f] = "ln -s '{}' '{}'".format(src, f)
+
+    rm_width = max(map(len, rm_cmds.values()))
+    ln_width = max(map(len, ln_cmds.values()))
+    sy_width = max(map(len, sy_cmds.values()))
+
+    for f, src in sorted(todelete.items()):
+        if choice == "Delete":
+            print(rm_cmds[f])
+        if choice == "Hardlink":
+            print('{: <{rm_width}} && {: <{ln_width}}'.format(rm_cmds[f], ln_cmds[f], rm_width=rm_width, ln_width=ln_width))
+        if choice == "Symlink":
+            print('{: <{rm_width}} && {: <{sy_width}}'.format(rm_cmds[f], sy_cmds[f], rm_width=rm_width, sy_width=sy_width))
+    
+    print('\n=== Process Files ===')
+    doit = input('Delete/link files now? Enter "DoItNow" --> ')
+    if doit == "DoItNow":
+        for f, src in todelete.items():
+            if choice == "Delete":
+                os.remove(f)
+            if choice == "Hardlink":
+                os.remove(f)
+                os.link(src, f)
+            if choice == "Symlink":
+                os.remove(f)
+                os.symlink(src, f)
+        if os.path.isfile(FDUPES_TMP_FILEPATH):
+            os.remove(FDUPES_TMP_FILEPATH)
+    else:
+        print("Aborting")
+
+if __name__ == '__main__':
+    ARGS = do_argparse()
+    fdupes_str = do_fdupes()
+    groups = parse_dupes(fdupes_str)
+    if groups:
+        choices = prompt_all_groups(groups)
+        delete_files(groups, choices)
