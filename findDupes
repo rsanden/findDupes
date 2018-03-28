@@ -102,7 +102,8 @@ def find_precedent(groups, choices, current_index, ignore_basenames=False):
         if set(current_group_dirnames).issubset(set(precedent_group_dirnames)):
             precedent_choice_dirname = os.path.dirname(choices[i])
             if ignore_basenames or current_group_basenames.count(current_group_basenames[0]) == len(current_group_basenames):
-                return current_group_dirnames.index(precedent_choice_dirname)
+                if precedent_choice_dirname in current_group_dirnames:
+                    return current_group_dirnames.index(precedent_choice_dirname)
     return None
 
 def prompt_group(groups, i):
